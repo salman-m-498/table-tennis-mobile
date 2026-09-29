@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilt & Flick Engine Demo</title>
+<style>
+:root{--bg:#f4f1ea;--fg:#1d1d1f;--pad:#d8d2c2;--card:#fff;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15161a;--fg:#eee;--pad:#2b2e38;--card:#20222a}}
+:root[data-theme="dark"]{--bg:#15161a;--fg:#eee;--pad:#2b2e38;--card:#20222a}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;touch-action:none;user-select:none}
+canvas{width:100%;max-width:480px;flex:1;min-height:0;display:block}
+#hud{display:flex;gap:8px;padding:8px;width:100%;max-width:480px;box-sizing:border-box;align-items:center;justify-content:space-between;flex-wrap:wrap}
+button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid #8886;background:var(--card);color:var(--fg)}
+#info{font-size:12px;opacity:.75;padding:0 10px 8px;max-width:480px;text-align:center}
+</style></head><body>
+<div id="hud"><b id="score">Score 0</b><span id="mode">Mouse mode</span><button id="cal">Calibrate</button><button id="sens">Enable sensors</button></div>
+<canvas id="c"></canvas>
+<div id="info">Phone: hold flat, tap Enable sensors, Calibrate, tilt to roll, flick up to pop. Desktop: move mouse = tilt, Space/click = flick.</div>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let W=0,H=0;
+function resize(){const r=cv.getBoundingClientRect(),d=devicePixelRatio||1;cv.width=r.width*d;cv.height=r.height*d;ctx.setTransform(d,0,0,d,0,0);W=r.width;H=r.height}
+addEventListener('resize',resize);resize();
+
+// ---- constants
+const MAX_TILT=20, TILT_ACCEL=1100, FRICTION=1.6, G=1500, FLICK_T=15, LP=0.4;
+const FLICK_K=45, FLICK_WINDOW=0.18, RESTITUTION=0.45, MIN_BOUNCE=80, MAX_VZ=1100;
+const R_BASE=22, R_PAD=130;
+
+// ---- state
+let cal={pitch:0,roll:0}, raw={pitch:0,roll:0}, accelSmooth=0, rawAccel=0;
+let ball, paddle={x:0,y:0}, flickTimer=0, flickMag=0, score=0, over=false, sensors=false, mouse={x:0,y:0};
+function reset(){ball={x:0,y:0,z:0,vx:0,vy:0,vz:0};score=0;over=false;flickTimer=0;upd()}
+function upd(){document.getElementById('score').textContent='Score '+score}
+
+// 1. calibrate
+function calibrate(p,r){cal.pitch=p;cal.roll=r}
+// 2. normalized tilt
+function getNormalizedTilt(p,r){
+  const cl=v=>Math.max(-MAX_TILT,Math.min(MAX_TILT,v));
+  return {tiltX:cl(r-cal.roll)/MAX_TILT, tiltY:cl(p-cal.pitch)/MAX_TILT};
+}
+// 3. flick detection (low-pass, threshold)
+function detectUpwardFlick(a){
+  accelSmooth=LP*a+(1-LP)*accelSmooth;
+  return accelSmooth>FLICK_T;
+}
+// 4. surface velocity
+function updateSurfaceVelocity(b,t,dt){
+  b.vx+=t.tiltX*TILT_ACCEL*dt; b.vy+=t.tiltY*TILT_ACCEL*dt;
+  const f=Math.max(0,1-FRICTION*dt); b.vx*=f; b.vy*=f;
+}
+// 5. surface position
+function updateSurfacePosition(b,dt){b.x+=b.vx*dt;b.y+=b.vy*dt}
+// 6. vertical impulse
+function applyVerticalImpulse(b,mag){b.vz=Math.min(MAX_VZ,mag*FLICK_K)}
+// 7. vertical physics
+function updateVerticalPhysics(b,dt){
+  if(b.z>0||b.vz>0){b.vz-=G*dt;b.z+=b.vz*dt}
+}
+// 8. collision state
+function checkCollisionState(b,p){
+  if(b.z>0)return 'IN_AIR';
+  const D=Math.hypot(b.x-p.x,b.y-p.y);
+  return D<=R_PAD?'BOUNCE_SUCCESS':'MISS_DROPPED';
+}
+// 9. resolve bounce
+function resolveBounce(b,flickActive){
+  const impact=Math.abs(b.vz);
+  if(flickActive){b.vz=Math.min(MAX_VZ,impact*RESTITUTION+flickMag*FLICK_K);score++;upd()}
+  else b.vz=impact*RESTITUTION;
+  if(b.vz<MIN_BOUNCE)b.vz=0;
+  b.z=0;
+}
+// 10. projection
+function project3DTo2D(b){
+  const s=1+b.z/300, dr=R_BASE*s, cx=W/2, cy=H/2;
+  return {drawX:cx+b.x, drawY:cy+b.y-b.z*0.35, drawRadius:dr,
+    shadowX:cx+b.x+b.z*0.25, shadowY:cy+b.y+b.z*0.25,
+    shadowOpacity:Math.max(0.08,0.5-b.z/700)};
+}
+// 11. draw
+function draw(r){
+  ctx.clearRect(0,0,W,H);
+  const cs=getComputedStyle(document.documentElement);
+  ctx.fillStyle=cs.getPropertyValue('--pad');
+  ctx.beginPath();ctx.arc(W/2+paddle.x,H/2+paddle.y,R_PAD,0,7);ctx.fill();
+  ctx.strokeStyle='#8886';ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle='rgba(0,0,0,'+r.shadowOpacity+')';
+  ctx.beginPath();ctx.ellipse(r.shadowX,r.shadowY,R_BASE,R_BASE*0.8,0,0,7);ctx.fill();
+  const g=ctx.createRadialGradient(r.drawX-r.drawRadius*.3,r.drawY-r.drawRadius*.3,2,r.drawX,r.drawY,r.drawRadius);
+  g.addColorStop(0,'#ffb27a');g.addColorStop(1,'#d9480f');
+  ctx.fillStyle=g;ctx.beginPath();ctx.arc(r.drawX,r.drawY,r.drawRadius,0,7);ctx.fill();
+  if(over){ctx.fillStyle='#000a';ctx.fillRect(0,0,W,H);ctx.fillStyle='#fff';ctx.textAlign='center';
+    ctx.font='bold 28px system-ui';ctx.fillText('Dropped! Score '+score,W/2,H/2-8);
+    ctx.font='16px system-ui';ctx.fillText('Tap to restart',W/2,H/2+22)}
+  else if(ball.z===0&&score===0&&Math.abs(ball.vz)===0){ctx.fillStyle='#8889';ctx.textAlign='center';ctx.font='14px system-ui';ctx.fillText('Flick to pop the ball (Space / tap)',W/2,H-24)}
+}
+
+// ---- inputs
+function triggerFlick(mag){flickTimer=FLICK_WINDOW;flickMag=mag;if(ball.z<=0&&!over)applyVerticalImpulse(ball,mag)}
+addEventListener('deviceorientation',e=>{if(e.beta==null)return;sensors=true;raw.pitch=e.beta;raw.roll=e.gamma;document.getElementById('mode').textContent='Sensor mode'});
+addEventListener('devicemotion',e=>{const a=e.acceleration;if(!a||a.z==null)return;rawAccel=a.z});
+addEventListener('mousemove',e=>{if(sensors)return;const r=cv.getBoundingClientRect();
+  mouse.x=(e.clientX-r.left-r.width/2)/(r.width/2);mouse.y=(e.clientY-r.top-r.height/2)/(r.height/2)});
+addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();if(over)reset();else triggerFlick(28)}});
+cv.addEventListener('pointerdown',()=>{if(over)reset();else if(!sensors)triggerFlick(28)});
+document.getElementById('cal').onclick=()=>calibrate(raw.pitch,raw.roll);
+document.getElementById('sens').onclick=async()=>{
+  try{if(DeviceOrientationEvent.requestPermission){await DeviceOrientationEvent.requestPermission();await DeviceMotionEvent.requestPermission()}}catch(e){}
+};
+
+// 12. game loop
+let last=0;
+function gameLoop(ts){
+  const dt=Math.min(0.033,(ts-last)/1000||0.016);last=ts;
+  if(!over){
+    let tilt;
+    if(sensors)tilt=getNormalizedTilt(raw.pitch,raw.roll);
+    else tilt={tiltX:Math.max(-1,Math.min(1,mouse.x)),tiltY:Math.max(-1,Math.min(1,mouse.y))};
+    if(sensors&&detectUpwardFlick(rawAccel)&&flickTimer<=0)triggerFlick(accelSmooth);
+    flickTimer=Math.max(0,flickTimer-dt);
+    updateSurfaceVelocity(ball,tilt,dt);
+    updateSurfacePosition(ball,dt);
+    const wasAir=ball.z>0;
+    updateVerticalPhysics(ball,dt);
+    if(ball.z<=0&&(wasAir||ball.vz<0)){
+      ball.z=Math.max(0,ball.z);
+      const st=checkCollisionState(ball,paddle);
+      if(st==='BOUNCE_SUCCESS')resolveBounce(ball,flickTimer>0);
+      else if(st==='MISS_DROPPED')over=true;
+    } else if(ball.z<=0&&checkCollisionState(ball,paddle)==='MISS_DROPPED')over=true;
+  }
+  draw(project3DTo2D(ball));
+  requestAnimationFrame(gameLoop);
+}
+reset();requestAnimationFrame(gameLoop);
+</script></body></html>
